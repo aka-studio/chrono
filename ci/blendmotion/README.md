@@ -43,13 +43,23 @@ BlendMotion repo with that tag — it downloads the assets into
 
 - SWIG is pinned to 4.3.1 (matches the original Windows build). Fallback pin
   if wrapper codegen breaks: `swig==4.2.1`.
-- `BUILD_SHARED_LIBS=OFF` + PIC produces self-contained extension modules
-  (no separate Chrono DLLs/sos). If a platform's static link fails, fallback:
-  build shared, copy `libChrono_*` next to the modules, and set rpath
-  (`patchelf --set-rpath '$ORIGIN'` on Linux,
-  `install_name_tool -add_rpath @loader_path` on macOS).
-- macOS natives are ad-hoc codesigned AFTER stripping (strip invalidates the
-  signature; Apple Silicon kills invalid binaries at dlopen).
+- Windows/Linux: `BUILD_SHARED_LIBS=OFF` + PIC produces self-contained
+  extension modules (no separate Chrono DLLs/sos), matching the original
+  BlendMotion Windows build.
+- macOS builds Chrono SHARED: with static libs each of the 4 extension
+  modules embeds its own copy of Chrono's C++ globals and (under the
+  -flat_namespace link Chrono uses on Apple) their destructors collide,
+  segfaulting at interpreter shutdown. The packaging script bundles the
+  `libChrono_*.dylib`s inside `pychrono/` and rewrites load commands to
+  `@loader_path/<name>`.
+- The hard libpython dependency is removed from all Linux/macOS binaries
+  (patchelf / LIEF): Blender resolves Python symbols from its own process,
+  and end-user machines need not have a system Python installed. The
+  packaging script FAILS if any libpython/Python.framework reference
+  survives (the CI runner has Python installed, so the smoke test alone
+  cannot catch this).
+- macOS natives are ad-hoc codesigned AFTER stripping/editing (both
+  invalidate the signature; Apple Silicon kills invalid binaries at dlopen).
 - Linux builds on ubuntu-22.04 → glibc ≥ 2.35 required at runtime. If older
   distro support is ever needed, rebuild in a manylinux_2_28 container.
 - Each job smoke-imports the packaged runtime before uploading, so a red job

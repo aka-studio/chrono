@@ -73,16 +73,104 @@ def stage_package(src: str, stage_pkg: str, license_path: str) -> list:
     return natives
 
 
-def strip_and_sign(natives: list):
+def _run_out(cmd):
+    return subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
+
+
+def fix_linux_libpython(natives: list):
+    """Drop the DT_NEEDED libpython entry: inside Blender the interpreter's
+    symbols come from the host process, and Blender does not put its bundled
+    libpython on the loader path."""
+    for n in natives:
+        needed = _run_out(["patchelf", "--print-needed", n]).split()
+        for dep in needed:
+            if dep.startswith("libpython"):
+                subprocess.run(["patchelf", "--remove-needed", dep, n], check=True)
+        after = _run_out(["patchelf", "--print-needed", n]).split()
+        if any(d.startswith("libpython") for d in after):
+            sys.exit(f"ERROR: libpython still in DT_NEEDED of {n}: {after}")
+        print(f"{os.path.basename(n)} NEEDED: {after}")
+
+
+def bundle_macos_dylibs(install_dir: str, stage_pkg: str, natives: list) -> list:
+    """Copy the shared Chrono dylibs next to the extension modules and rewrite
+    every load command that references them to @loader_path/<name>. Also strip
+    the hard Python.framework load command (LIEF): Blender resolves Python
+    symbols from its own process and end-user Macs need not have python.org
+    Python installed."""
+    import lief
+
+    libdirs = [os.path.join(install_dir, "lib"), os.path.join(install_dir, "lib64")]
+
+    def find_lib(basename):
+        for d in libdirs:
+            p = os.path.join(d, basename)
+            if os.path.exists(p):
+                return os.path.realpath(p)
+        return None
+
+    # Transitive closure of Chrono dylib deps referenced by the modules.
+    bundled = {}
+    queue = list(natives)
+    while queue:
+        binpath = queue.pop()
+        for line in _run_out(["otool", "-L", binpath]).splitlines()[1:]:
+            dep = line.strip().split(" (")[0]
+            base = os.path.basename(dep)
+            if "Chrono" not in base or base in bundled:
+                continue
+            src = find_lib(base)
+            if not src:
+                sys.exit(f"ERROR: cannot locate bundled dep {base} under {libdirs}")
+            dst = os.path.join(stage_pkg, base)
+            shutil.copy2(src, dst)
+            bundled[base] = dst
+            queue.append(dst)
+
+    all_bins = natives + list(bundled.values())
+    for binpath in all_bins:
+        for line in _run_out(["otool", "-L", binpath]).splitlines()[1:]:
+            dep = line.strip().split(" (")[0]
+            base = os.path.basename(dep)
+            if base in bundled and dep != f"@loader_path/{base}":
+                subprocess.run(["install_name_tool", "-change", dep,
+                                f"@loader_path/{base}", binpath], check=True)
+        # Remove the absolute Python.framework/libpython load command.
+        macho = lief.MachO.parse(binpath)
+        changed = False
+        for b in macho:
+            for lib in list(b.libraries):
+                if "Python.framework" in lib.name or "libpython" in lib.name:
+                    b.remove(lib)
+                    changed = True
+        if changed:
+            macho.write(binpath)
+    for name, path in bundled.items():
+        subprocess.run(["install_name_tool", "-id", f"@loader_path/{name}", path],
+                       check=True)
+    # Hard check: no Python framework reference may survive (the CI runner has
+    # the framework installed, so the smoke test alone cannot catch this).
+    for binpath in all_bins:
+        out = _run_out(["otool", "-L", binpath])
+        if "Python.framework" in out or "libpython" in out:
+            sys.exit(f"ERROR: Python load command still present in {binpath}:\n{out}")
+        print(out.strip())
+    return all_bins
+
+
+def strip_and_sign(install_dir: str, stage_pkg: str, natives: list):
     if sys.platform.startswith("linux"):
+        # strip BEFORE patchelf: binutils strip can corrupt a patchelf-edited ELF.
         for n in natives:
             subprocess.run(["strip", "--strip-unneeded", n], check=True)
+        fix_linux_libpython(natives)
     elif sys.platform == "darwin":
-        for n in natives:
+        all_bins = bundle_macos_dylibs(install_dir, stage_pkg, natives)
+        for n in all_bins:
             subprocess.run(["strip", "-x", n], check=True)
-        # Re-sign AFTER strip: strip invalidates the ad-hoc signature and
-        # Apple Silicon SIGKILLs unsigned/invalid binaries at dlopen.
-        for n in natives:
+        # Re-sign AFTER strip and LIEF edits: both invalidate the ad-hoc
+        # signature and Apple Silicon SIGKILLs invalid binaries at dlopen.
+        for n in all_bins:
             subprocess.run(["codesign", "--force", "--sign", "-", n], check=True)
 
 
@@ -135,7 +223,7 @@ def main():
     stage_pkg = os.path.join(stage_dir, "pychrono")
 
     natives = stage_package(src, stage_pkg, args.license)
-    strip_and_sign(natives)
+    strip_and_sign(args.install_dir, stage_pkg, natives)
     smoke_test(stage_dir)
 
     out_zip = os.path.join(args.out, f"pychrono_runtime_{args.plat}_{args.pytag}.zip")

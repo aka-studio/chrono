@@ -69,6 +69,11 @@ jobs:
           # swig 4.3.1 matches the build the addon was developed against.
           # Fallback pin if SWIG codegen errors appear: swig==4.2.1
           pip install numpy "swig==4.3.1" ninja
+          # Packaging-time binary surgery: extension modules must not carry a
+          # hard libpython dependency (Blender resolves Python symbols from
+          # its own process, not from a disk copy).
+          if [ "$RUNNER_OS" = "Linux" ]; then pip install patchelf; fi
+          if [ "$RUNNER_OS" = "macOS" ]; then pip install lief; fi
           swig -version
           cmake --version
 
@@ -99,9 +104,17 @@ jobs:
           if [ -n "${EIGEN3_INCLUDE_DIR:-}" ]; then
             EXTRA="-DEIGEN3_INCLUDE_DIR=${EIGEN3_INCLUDE_DIR}"
           fi
+          # macOS must use shared Chrono libs: with static libs each of the 4
+          # extension modules embeds its own copy of Chrono's C++ globals and
+          # (under the -flat_namespace link Chrono uses on Apple) their
+          # destructors collide -> SIGSEGV at interpreter shutdown.
+          # Windows/Linux keep static (self-contained, matches the original
+          # BlendMotion Windows build).
+          SHARED=OFF
+          if [ "$RUNNER_OS" = "macOS" ]; then SHARED=ON; fi
           cmake -S chrono -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_SHARED_LIBS=$SHARED \
             -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
             -DCH_ENABLE_MODULE_PYTHON=ON \
             -DCH_ENABLE_MODULE_VEHICLE=ON \
