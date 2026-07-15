@@ -112,6 +112,12 @@ jobs:
           # BlendMotion Windows build).
           SHARED=OFF
           if [ "$RUNNER_OS" = "macOS" ]; then SHARED=ON; fi
+          # Chrono's FindSIMD tunes codegen to the BUILD host's CPU (AVX/AVX2/
+          # FMA). Hosted runners vary, and end-user CPUs vary more — a binary
+          # built on an AVX-512 runner SIGILLs elsewhere. Disable on x86 for
+          # portable baseline codegen; keep it on macOS (NEON is universal on
+          # Apple Silicon).
+          if [ "$RUNNER_OS" != "macOS" ]; then EXTRA="$EXTRA -DCH_USE_SIMD=OFF"; fi
           cmake -S chrono -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=$SHARED \
